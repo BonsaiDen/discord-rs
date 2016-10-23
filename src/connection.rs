@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use websocket::client::{Client, Sender, Receiver};
 use websocket::stream::WebSocketStream;
+use websocket::result::WebSocketError;
 
 use serde_json;
 use serde_json::builder::ObjectBuilder;
@@ -43,6 +44,7 @@ macro_rules! voice_only {
 pub struct Connection {
 	keepalive_channel: mpsc::Sender<Status>,
 	receiver: Receiver<WebSocketStream>,
+	non_blocking: bool,
 	#[cfg(feature="voice")]
 	voice_handles: HashMap<Option<ServerId>, VoiceConnection>,
 	#[cfg(feature="voice")]
@@ -126,6 +128,7 @@ impl Connection {
 		Ok((finish_connection!(
 			keepalive_channel: tx,
 			receiver: receiver,
+			non_blocking: false,
 			ws_url: base_url.to_owned(),
 			token: token.to_owned(),
 			session_id: Some(session_id),
@@ -135,6 +138,17 @@ impl Connection {
 			user_id: ready.user.id,
 			voice_handles: HashMap::new(),
 		), ready))
+	}
+
+	/// Set the websocket blocking mode.
+	pub fn set_non_blocking(&mut self, mode: bool) {
+		self.non_blocking = mode;
+		{
+			match *self.receiver.get_mut().get_mut() {
+				WebSocketStream::Tcp(ref inner) => inner.set_nonblocking(mode).unwrap(),
+				WebSocketStream::Ssl(ref inner) => inner.get_ref().set_nonblocking(mode).unwrap(),
+			};
+		}
 	}
 
 	/// Change the game information that this client reports as playing.
@@ -180,19 +194,36 @@ impl Connection {
 		self.voice_handles.remove(&server_id);
 	}
 
-	/// Receive an event over the websocket, blocking until one is available.
+	/// Receive an event over the websocket. By default this will block until
+	/// an event is available.
+	///
+	/// In case `.set_non_blocking(true)` was called, this will return
+	/// `Error::WouldBlock` in case no new event is available.
 	pub fn recv_event(&mut self) -> Result<Event> {
 		match self.receiver.recv_json(GatewayEvent::decode) {
 			Err(Error::WebSocket(err)) => {
-				warn!("Websocket error, reconnecting: {:?}", err);
-				// Try resuming if we haven't received an InvalidateSession
-				if let Some(session_id) = self.session_id.clone() {
-					match self.resume(session_id) {
-						Ok(event) => return Ok(event),
-						Err(e) => debug!("Failed to resume: {:?}", e),
+
+				// Check if the error is due to the websocket being in
+				// non-blocking mode
+				let would_block = match &err {
+					&WebSocketError::IoError(ref err) => err.kind() == ::std::io::ErrorKind::WouldBlock,
+					_ => false
+				};
+
+				if self.non_blocking && would_block {
+					Err(Error::WouldBlock)
+
+				} else {
+					warn!("Websocket error, reconnecting: {:?}", err);
+					// Try resuming if we haven't received an InvalidateSession
+					if let Some(session_id) = self.session_id.clone() {
+						match self.resume(session_id) {
+							Ok(event) => return Ok(event),
+							Err(e) => debug!("Failed to resume: {:?}", e),
+						}
 					}
+					self.reconnect().map(Event::Ready)
 				}
-				self.reconnect().map(Event::Ready)
 			}
 			Err(Error::Closed(num, message)) => {
 				warn!("Closure, reconnecting: {:?}: {}", num, message);

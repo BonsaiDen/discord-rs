@@ -22,6 +22,8 @@ pub enum Error {
 	WebSocket(WebSocketError),
 	/// A `std::io` module error
 	Io(IoError),
+	/// A non-blocking websocket received no data.
+	WouldBlock,
 	/// An error in the Opus library, with the function name and error code
 	#[cfg(feature="voice")]
 	Opus(OpusError),
@@ -110,6 +112,7 @@ impl StdError for Error {
 			Error::Json(ref inner) => inner.description(),
 			Error::WebSocket(ref inner) => inner.description(),
 			Error::Io(ref inner) => inner.description(),
+			Error::WouldBlock => "No data received",
 			#[cfg(feature="voice")]
 			Error::Opus(ref inner) => inner.description(),
 			Error::Closed(_, _) => "Connection closed",
