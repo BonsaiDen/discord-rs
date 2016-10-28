@@ -13,7 +13,7 @@ use opus;
 use serde_json;
 use serde_json::builder::ObjectBuilder;
 use sodiumoxide::crypto::secretbox as crypto;
-use websocket::client::{Client, Sender};
+use websocket::client::{Client, Sender, Receiver};
 use websocket::stream::WebSocketStream;
 
 use model::*;
@@ -488,10 +488,7 @@ impl InternalConnection {
 		try!(sender.send_json(&map));
 
 		// read the first websocket message
-		let (interval, port, ssrc, modes) = match try!(receiver.recv_json(VoiceEvent::decode)) {
-			VoiceEvent::Handshake { heartbeat_interval, port, ssrc, modes } => (heartbeat_interval, port, ssrc, modes),
-			_ => return Err(Error::Protocol("First voice event was not Handshake"))
-		};
+		let (interval, port, ssrc, modes) = try!(get_voice_handshake(&mut receiver));
 		if !modes.iter().any(|s| s == "xsalsa20_poly1305") {
 			return Err(Error::Protocol("Voice mode \"xsalsa20_poly1305\" unavailable"))
 		}
@@ -788,4 +785,26 @@ impl Drop for InternalConnection {
 enum RecvStatus {
 	Websocket(VoiceEvent),
 	Udp(Vec<u8>),
+}
+
+fn get_voice_handshake(receiver: &mut Receiver<WebSocketStream>) -> Result<(u64, u16, u32, Vec<String>)> {
+
+    let mut tries = 0;
+    loop {
+		match receiver.recv_json(VoiceEvent::decode) {
+			Ok(VoiceEvent::Handshake { heartbeat_interval, port, ssrc, modes }) => {
+                return Ok((heartbeat_interval, port, ssrc, modes));
+            }
+			Ok(_) => {
+                if tries == 3 {
+                    return Err(Error::Protocol("Handshake not found within first 3 voice events"))
+
+                } else {
+                    tries += 1;
+                }
+            },
+            Err(_) => return Err(Error::Protocol("Handshake not found within first 3 voice events"))
+		};
+    }
+
 }
