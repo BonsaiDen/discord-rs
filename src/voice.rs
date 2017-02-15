@@ -13,7 +13,7 @@ use opus;
 use serde_json;
 use serde_json::builder::ObjectBuilder;
 use sodiumoxide::crypto::secretbox as crypto;
-use websocket::client::{Client, Sender, Receiver};
+use websocket::client::{Client, Sender};
 use websocket::stream::WebSocketStream;
 
 use model::*;
@@ -66,7 +66,7 @@ pub trait AudioReceiver: Send {
 	/// This method is the only way to know the `ssrc` to `user_id` mapping, but is unreliable and
 	/// only a hint for when users are actually speaking, due both to latency differences and that
 	/// it is possible for a user to leave `speaking` true even when they are not sending audio.
-	fn speaking_update(&mut self, ssrc: u32, user_id: &UserId, speaking: bool);
+	fn speaking_update(&mut self, ssrc: u32, user_id: UserId, speaking: bool);
 
 	/// Called when a voice packet is received.
 	///
@@ -487,8 +487,24 @@ impl InternalConnection {
 			.build();
 		try!(sender.send_json(&map));
 
-		// read the first websocket message
-		let (interval, port, ssrc, modes) = try!(get_voice_handshake(&mut receiver));
+		let stuff;
+		loop {
+			match try!(receiver.recv_json(VoiceEvent::decode)) {
+				VoiceEvent::Heartbeat { .. } => {
+					// TODO: handle this by beginning to heartbeat at the
+					// supplied interval
+				}
+				VoiceEvent::Handshake { heartbeat_interval, port, ssrc, modes, ip } => {
+					stuff = (heartbeat_interval, port, ssrc, modes, ip);
+					break;
+				}
+				other => {
+					debug!("Unexpected voice msg: {:?}", other);
+					return Err(Error::Protocol("Unexpected message setting up voice"));
+				}
+			}
+		}
+		let (interval, port, ssrc, modes, ip) = stuff;
 		if !modes.iter().any(|s| s == "xsalsa20_poly1305") {
 			return Err(Error::Protocol("Voice mode \"xsalsa20_poly1305\" unavailable"))
 		}
@@ -496,7 +512,7 @@ impl InternalConnection {
 		// bind a UDP socket and send the ssrc value in a packet as identification
 		let destination = {
 			use std::net::ToSocketAddrs;
-			try!(try!((&endpoint[..], port).to_socket_addrs())
+			try!(try!((ip.as_ref().map(|ip| &ip[..]).unwrap_or(&endpoint[..]), port).to_socket_addrs())
 				.next()
 				.ok_or(Error::Other("Failed to resolve voice hostname")))
 		};
@@ -600,7 +616,7 @@ impl InternalConnection {
 			(rx, ws_thread, udp_thread)
 		};
 
-		info!("Voice connected to {}", endpoint);
+		info!("Voice connected to {} ({})", endpoint, destination);
 		Ok(InternalConnection {
 			sender: sender,
 			receive_chan: receive_chan,
@@ -618,7 +634,7 @@ impl InternalConnection {
 			silence_frames: 0,
 
 			decoder_map: HashMap::new(),
-			encoder: try!(opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::CodingMode::Audio)),
+			encoder: try!(opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Audio)),
 			encoder_stereo: false,
 			keepalive_timer: ::Timer::new(interval),
 			// after 5 minutes of us sending nothing, Discord will stop sending voice data to us
@@ -643,7 +659,7 @@ impl InternalConnection {
 			while let Ok(status) = self.receive_chan.try_recv() {
 				match status {
 					RecvStatus::Websocket(VoiceEvent::SpeakingUpdate { user_id, ssrc, speaking }) => {
-						receiver.speaking_update(ssrc, &user_id, speaking);
+						receiver.speaking_update(ssrc, user_id, speaking);
 					},
 					RecvStatus::Websocket(_) => {},
 					RecvStatus::Udp(packet) => {
@@ -691,7 +707,7 @@ impl InternalConnection {
 			let stereo = source.is_stereo();
 			if stereo != self.encoder_stereo {
 				let channels = if stereo { opus::Channels::Stereo } else { opus::Channels::Mono };
-				self.encoder = try!(opus::Encoder::new(SAMPLE_RATE, channels, opus::CodingMode::Audio));
+				self.encoder = try!(opus::Encoder::new(SAMPLE_RATE, channels, opus::Application::Audio));
 				self.encoder_stereo = stereo;
 			}
 			let buffer_len = if stereo { 960 * 2 } else { 960 };
@@ -787,24 +803,3 @@ enum RecvStatus {
 	Udp(Vec<u8>),
 }
 
-fn get_voice_handshake(receiver: &mut Receiver<WebSocketStream>) -> Result<(u64, u16, u32, Vec<String>)> {
-
-    let mut tries = 0;
-    loop {
-		match receiver.recv_json(VoiceEvent::decode) {
-			Ok(VoiceEvent::Handshake { heartbeat_interval, port, ssrc, modes }) => {
-                return Ok((heartbeat_interval, port, ssrc, modes));
-            }
-			Ok(_) => {
-                if tries == 3 {
-                    return Err(Error::Protocol("Handshake not found within first 3 voice events"))
-
-                } else {
-                    tries += 1;
-                }
-            },
-            Err(_) => return Err(Error::Protocol("Handshake not found within first 3 voice events"))
-		};
-    }
-
-}

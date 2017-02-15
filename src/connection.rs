@@ -31,15 +31,6 @@ macro_rules! finish_connection {
 	}}
 }
 
-#[cfg(feature="voice")]
-macro_rules! voice_only {
-	($b:block) => {$b}
-}
-#[cfg(not(feature="voice"))]
-macro_rules! voice_only {
-	($b:block) => {}
-}
-
 /// Websocket connection to the Discord servers.
 pub struct Connection {
 	keepalive_channel: mpsc::Sender<Status>,
@@ -153,10 +144,30 @@ impl Connection {
 
 	/// Change the game information that this client reports as playing.
 	pub fn set_game(&self, game: Option<Game>) {
+		self.set_presence(game, OnlineStatus::Online, false)
+	}
+
+	/// Set the client to be playing this game, with defaults used for any
+	/// extended information.
+	pub fn set_game_name(&self, name: String) {
+		self.set_presence(Some(Game::playing(name)), OnlineStatus::Online, false);
+	}
+
+	/// Sets the active presence of the client, including game and/or status
+	/// information.
+	///
+	/// `afk` will help Discord determine where to send notifications.
+	pub fn set_presence(&self, game: Option<Game>, status: OnlineStatus, afk: bool) {
+		let status = match status {
+			OnlineStatus::Offline => OnlineStatus::Invisible,
+			other => other,
+		};
 		let msg = ObjectBuilder::new()
 			.insert("op", 3)
 			.insert_object("d", move |mut object| {
-				object = object.insert("idle_since", serde_json::Value::Null);
+				object = object.insert("afk", afk)
+					.insert("since", 0)
+					.insert("status", status.name());
 				match game {
 					Some(game) => object.insert_object("game", move |o| o.insert("name", game.name)),
 					None => object.insert("game", serde_json::Value::Null),
@@ -164,12 +175,6 @@ impl Connection {
 			})
 			.build();
 		let _ = self.keepalive_channel.send(Status::SendMessage(msg));
-	}
-
-	/// Set the client to be playing this game, with defaults used for any
-	/// extended information.
-	pub fn set_game_name(&self, name: String) {
-		self.set_game(Some(Game::playing(name)));
 	}
 
 	/// Get a handle to the voice connection for a server.
@@ -200,97 +205,93 @@ impl Connection {
 	/// In case `.set_non_blocking(true)` was called, this will return
 	/// `Error::WouldBlock` in case no new event is available.
 	pub fn recv_event(&mut self) -> Result<Event> {
-		match self.receiver.recv_json(GatewayEvent::decode) {
-			Err(Error::WebSocket(err)) => {
+		loop {
+            match self.receiver.recv_json(GatewayEvent::decode) {
+                Err(Error::WebSocket(err)) => {
 
-				// Check if the error is due to the websocket being in
-				// non-blocking mode
-				let would_block = match &err {
-					&WebSocketError::IoError(ref err) => err.kind() == ::std::io::ErrorKind::WouldBlock,
-					_ => false
-				};
+                    // Check if the error is due to the websocket being in
+                    // non-blocking mode
+                    let would_block = match &err {
+                        &WebSocketError::IoError(ref err) => err.kind() == ::std::io::ErrorKind::WouldBlock,
+                        _ => false
+                    };
 
-				if self.non_blocking && would_block {
-					Err(Error::WouldBlock)
+                    if self.non_blocking && would_block {
+                        return Err(Error::WouldBlock);
 
-				} else {
-					warn!("Websocket error, reconnecting: {:?}", err);
-					// Try resuming if we haven't received an InvalidateSession
-					if let Some(session_id) = self.session_id.clone() {
-						match self.resume(session_id) {
-							Ok(event) => return Ok(event),
-							Err(e) => debug!("Failed to resume: {:?}", e),
+                    } else {
+                        warn!("Websocket error, reconnecting: {:?}", err);
+                        // Try resuming if we haven't received an InvalidateSession
+                        if let Some(session_id) = self.session_id.clone() {
+                            match self.resume(session_id) {
+                                Ok(event) => return Ok(event),
+                                Err(e) => debug!("Failed to resume: {:?}", e),
+                            }
+                        }
+                        return self.reconnect().map(Event::Ready);
+                    }
+                }
+				Err(Error::Closed(num, message)) => {
+					warn!("Closure, reconnecting: {:?}: {}", num, message);
+					// Try resuming if we haven't received a 1000, a 4006, or an InvalidateSession
+					if num != Some(1000) && num != Some(4006) {
+						if let Some(session_id) = self.session_id.clone() {
+							match self.resume(session_id) {
+								Ok(event) => return Ok(event),
+								Err(e) => debug!("Failed to resume: {:?}", e),
+							}
 						}
 					}
-					self.reconnect().map(Event::Ready)
+					// If resuming didn't work, reconnect
+					return self.reconnect().map(Event::Ready);
 				}
-			}
-			Err(Error::Closed(num, message)) => {
-				warn!("Closure, reconnecting: {:?}: {}", num, message);
-				// Try resuming if we haven't received a 1000, a 4006, or an InvalidateSession
-				if num != Some(1000) && num != Some(4006) {
-					if let Some(session_id) = self.session_id.clone() {
-						match self.resume(session_id) {
-							Ok(event) => return Ok(event),
-							Err(e) => debug!("Failed to resume: {:?}", e),
+				Err(error) => return Err(error),
+				Ok(GatewayEvent::Hello(interval)) => {
+					debug!("Mysterious late-game hello: {}", interval);
+				}
+				Ok(GatewayEvent::Dispatch(sequence, event)) => {
+					self.last_sequence = sequence;
+					let _ = self.keepalive_channel.send(Status::Sequence(sequence));
+					#[cfg(feature="voice")] {
+						if let Event::VoiceStateUpdate(server_id, ref voice_state) = event {
+							self.voice(server_id).__update_state(voice_state);
+						}
+						if let Event::VoiceServerUpdate { server_id, channel_id: _, ref endpoint, ref token } = event {
+							self.voice(server_id).__update_server(endpoint, token);
 						}
 					}
+					return Ok(event);
 				}
-				self.reconnect().map(Event::Ready)
-			}
-			Err(error) => Err(error),
-			Ok(GatewayEvent::Hello(interval)) => {
-				debug!("Mysterious late-game hello: {}", interval);
-				self.recv_event()
-			}
-			Ok(GatewayEvent::Dispatch(sequence, event)) => {
-				self.last_sequence = sequence;
-				let _ = self.keepalive_channel.send(Status::Sequence(sequence));
-				if let Event::Resumed { heartbeat_interval, .. } = event {
-					debug!("Resumed successfully");
-					let _ = self.keepalive_channel.send(Status::ChangeInterval(heartbeat_interval));
+				Ok(GatewayEvent::Heartbeat(sequence)) => {
+					debug!("Heartbeat received with seq {}", sequence);
+					let map = ObjectBuilder::new()
+						.insert("op", 1)
+						.insert("d", sequence)
+						.build();
+					let _ = self.keepalive_channel.send(Status::SendMessage(map));
 				}
-				voice_only! {{
-					if let Event::VoiceStateUpdate(server_id, ref voice_state) = event {
-						self.voice(server_id).__update_state(voice_state);
-					}
-					if let Event::VoiceServerUpdate { server_id, channel_id: _, ref endpoint, ref token } = event {
-						self.voice(server_id).__update_server(endpoint, token);
-					}
-				}}
-				Ok(event)
-			}
-			Ok(GatewayEvent::Heartbeat(sequence)) => {
-				debug!("Heartbeat received with seq {}", sequence);
-				let map = ObjectBuilder::new()
-					.insert("op", 1)
-					.insert("d", sequence)
-					.build();
-				let _ = self.keepalive_channel.send(Status::SendMessage(map));
-				self.recv_event()
-			}
-			Ok(GatewayEvent::HeartbeatAck) => {
-				self.recv_event()
-			}
-			Ok(GatewayEvent::Reconnect) => {
-				self.reconnect().map(Event::Ready)
-			}
-			Ok(GatewayEvent::InvalidateSession) => {
-				debug!("Session invalidated, reidentifying");
-				self.session_id = None;
-				let _ = self.keepalive_channel.send(Status::SendMessage(identify(&self.token, self.shard_info)));
-				self.recv_event()
+				Ok(GatewayEvent::HeartbeatAck) => {
+				}
+				Ok(GatewayEvent::Reconnect) => {
+					return self.reconnect().map(Event::Ready);
+				}
+				Ok(GatewayEvent::InvalidateSession) => {
+					debug!("Session invalidated, reidentifying");
+					self.session_id = None;
+					let _ = self.keepalive_channel.send(Status::SendMessage(identify(&self.token, self.shard_info)));
+				}
 			}
 		}
 	}
 
 	/// Reconnect after receiving an OP7 RECONNECT
 	fn reconnect(&mut self) -> Result<ReadyEvent> {
+		::sleep_ms(1000);
 		debug!("Reconnecting...");
 		// Make two attempts on the current known gateway URL
 		for _ in 0..2 {
 			if let Ok((conn, ready)) = Connection::new(&self.ws_url, &self.token, self.shard_info) {
-				try!(::std::mem::replace(self, conn).shutdown());
+				::std::mem::replace(self, conn).raw_shutdown();
 				self.session_id = Some(ready.session_id.clone());
 				return Ok(ready)
 			}
@@ -298,13 +299,14 @@ impl Connection {
 		}
 		// If those fail, hit REST for a new endpoint
 		let (conn, ready) = try!(::Discord::from_token_raw(self.token.to_owned()).connect());
-		try!(::std::mem::replace(self, conn).shutdown());
+		::std::mem::replace(self, conn).raw_shutdown();
 		self.session_id = Some(ready.session_id.clone());
 		Ok(ready)
 	}
 
 	/// Resume using our existing session
 	fn resume(&mut self, session_id: String) -> Result<Event> {
+		::sleep_ms(1000);
 		debug!("Resuming...");
 		// close connection and re-establish
 		try!(self.receiver.get_mut().get_mut().shutdown(::std::net::Shutdown::Both));
@@ -328,7 +330,13 @@ impl Connection {
 		let first_event;
 		loop {
 			match try!(receiver.recv_json(GatewayEvent::decode)) {
+				GatewayEvent::Hello(interval) => {
+					let _ = self.keepalive_channel.send(Status::ChangeInterval(interval));
+				}
 				GatewayEvent::Dispatch(seq, event) => {
+					if let Event::Resumed { .. } = event {
+						debug!("Resumed successfully");
+					}
 					if let Event::Ready(ReadyEvent { ref session_id, .. }) = event {
 						self.session_id = Some(session_id.clone());
 					}
@@ -365,6 +373,13 @@ impl Connection {
 		try!(stream.flush());
 		try!(stream.shutdown(::std::net::Shutdown::Both));
 		Ok(())
+	}
+
+	fn raw_shutdown(mut self) {
+		use std::io::Write;
+		let stream = self.receiver.get_mut().get_mut();
+		let _ = stream.flush();
+		let _ = stream.shutdown(::std::net::Shutdown::Both);
 	}
 
 	#[doc(hidden)]
