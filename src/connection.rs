@@ -224,7 +224,11 @@ impl Connection {
                         // Try resuming if we haven't received an InvalidateSession
                         if let Some(session_id) = self.session_id.clone() {
                             match self.resume(session_id) {
-                                Ok(event) => return Ok(event),
+                                Ok(event) => {
+                                    let is_non_blocking = self.non_blocking;
+                                    self.set_non_blocking(is_non_blocking);
+                                    return Ok(event)
+                                },
                                 Err(e) => debug!("Failed to resume: {:?}", e),
                             }
                         }
